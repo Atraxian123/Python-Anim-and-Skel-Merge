@@ -199,7 +199,7 @@ def build_skb1_for_write(raw_skb1, local_payload, overrides):
     return {'bones': bones_out, 'keybonelookup': raw_skb1['keybonelookup']}
 
 
-def merge_skel_anim(skel_path, out_path, anim_paths):
+def merge_skel_anim(skel_path, out_path, anim_paths, force_all_embedded=False):
     skel_chunks = ms.load(skel_path)
     skb1_payload = skel_chunks['SKB1']
     sks1 = ms.parse_sks1(skel_chunks['SKS1'])
@@ -262,6 +262,27 @@ def merge_skel_anim(skel_path, out_path, anim_paths):
             sks1['anims'][idx] = dict(sks1['anims'][idx])
             sks1['anims'][idx]['raw'] = bytes(new_raw)
 
+    if force_all_embedded:
+        forced = 0
+        for idx, a in enumerate(sks1['anims']):
+            raw = a['raw']
+            flags = struct.unpack_from('<I', raw, SKS1_FLAGS_OFFSET)[0]
+            if flags & SKS1_EMBEDDED_FLAG:
+                continue
+            new_raw = bytearray(raw)
+            struct.pack_into('<I', new_raw, SKS1_FLAGS_OFFSET, flags | SKS1_EMBEDDED_FLAG)
+            sks1['anims'][idx] = dict(a)
+            sks1['anims'][idx]['raw'] = bytes(new_raw)
+            forced += 1
+        if forced:
+            print("  [force-embedded] set flag 0x20 on %d additional SKS1 entries that had no "
+                  "baked .anim data of their own (their track arrays are left exactly as they "
+                  "were -- only the flag changes). Use this only if the normal alias handling "
+                  "didn't fix playback; forcing the flag on a sequence that has neither real "
+                  "embedded data nor a valid alias chain to one that does will make the client "
+                  "think it has data when it doesn't, which can look wrong or worse than leaving "
+                  "it flagged external." % forced)
+
     merged_skb1 = build_skb1_for_write(raw_skb1, skb1_payload, overrides)
 
     # sanity: make sure nothing came back as None (== couldn't be read, would corrupt output)
@@ -313,11 +334,20 @@ def merge_skel_anim(skel_path, out_path, anim_paths):
 
 def main():
     if len(sys.argv) < 4:
-        print("Uso: python3 merge_anim_into_skel.py <parent.skel> <out.skel> <anim1.anim> [anim2.anim ...]")
+        print("Uso: python3 merge_anim_into_skel.py [--force-all-embedded] <parent.skel> <out.skel> <anim1.anim> [anim2.anim ...]")
+        print("  --force-all-embedded: dopo l'incorporazione normale, forza il flag 0x20 (embedded)")
+        print("                        su TUTTE le animazioni dello .skel, incluse quelle senza")
+        print("                        un .anim incorporato o una catena alias valida. Da usare")
+        print("                        solo se il comportamento normale non risolve i problemi di")
+        print("                        riproduzione -- vedi l'avviso stampato quando viene usato.")
         sys.exit(1)
-    skel_path, out_path = sys.argv[1], sys.argv[2]
-    anim_paths = sys.argv[3:]
-    merge_skel_anim(skel_path, out_path, anim_paths)
+    args = sys.argv[1:]
+    force_all_embedded = '--force-all-embedded' in args
+    if force_all_embedded:
+        args = [a for a in args if a != '--force-all-embedded']
+    skel_path, out_path = args[0], args[1]
+    anim_paths = args[2:]
+    merge_skel_anim(skel_path, out_path, anim_paths, force_all_embedded=force_all_embedded)
 
 
 if __name__ == '__main__':

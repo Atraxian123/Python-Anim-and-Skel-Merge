@@ -33,6 +33,7 @@ import merge_skel as ms  # reuse chunk I/O + SKB1/SKS1 parse/write from the exis
 
 SKS1_FLAGS_OFFSET = 0x0C
 SKS1_EMBEDDED_FLAG = 0x20
+SKS1_ALIAS_FLAG = 0x40  # M2Sequence.flags: this record is an alias of another (no own track data)
 
 
 def anim_id_subid_from_filename(path):
@@ -199,6 +200,91 @@ def build_skb1_for_write(raw_skb1, local_payload, overrides):
     return {'bones': bones_out, 'keybonelookup': raw_skb1['keybonelookup']}
 
 
+SKS1_ALIASNEXT_OFFSET = 0x3E  # M2Sequence: uint16, direct index into the sequences array
+
+
+def resolve_sequence_aliases(sks1, merged_skb1):
+    """
+    For every SKS1 entry marked as an alias (flags & 0x40) that isn't itself
+    already embedded, follow the aliasNext chain (a direct array index, not
+    an animID -- verified against real data: e.g. index 26 -> aliasNext 25,
+    and index 25 is the real animID=60 entry with matching duration) to find
+    a target that DOES have real embedded data (flags & 0x20). If one is
+    found, copy that target's actual bone-track data (every bone, every
+    channel) into the alias's own index slot, and set the alias's own
+    flags |= 0x20.
+
+    This matters because not every tool that reads a .skel implements the
+    "flags & 0x20 unset + flags & 0x40 set -> follow aliasNext instead"
+    fallback the game client uses (e.g. some importers just check flags &
+    0x20 directly and go looking for an external .anim file that, for a
+    pure alias, never existed in the first place). Giving the alias its own
+    real copy of the data sidesteps that entirely, at the cost of a small
+    amount of duplicated data.
+
+    Only ever copies data pulled from a genuinely-embedded source -- never
+    invents or forces anything, so this is safe to run unconditionally.
+    """
+    n = len(sks1['anims'])
+
+    def flags_of(i):
+        return struct.unpack_from('<I', sks1['anims'][i]['raw'], SKS1_FLAGS_OFFSET)[0]
+
+    resolved, unresolved = [], []
+
+    for idx in range(n):
+        flags = flags_of(idx)
+        if not (flags & SKS1_ALIAS_FLAG) or (flags & SKS1_EMBEDDED_FLAG):
+            continue  # not an alias, or already has its own real/embedded data
+
+        visited = set()
+        cur = idx
+        target = None
+        for _ in range(32):  # generous hop limit; real chains seen so far are 1-2 hops
+            nxt = struct.unpack_from('<H', sks1['anims'][cur]['raw'], SKS1_ALIASNEXT_OFFSET)[0]
+            if nxt >= n or nxt in visited:
+                break
+            visited.add(nxt)
+            if flags_of(nxt) & SKS1_EMBEDDED_FLAG:
+                target = nxt
+                break
+            if not (flags_of(nxt) & SKS1_ALIAS_FLAG):
+                break  # dead end: points at a non-alias entry with no data of its own either
+            cur = nxt
+
+        if target is None:
+            unresolved.append(idx)
+            continue
+
+        for bone in merged_skb1['bones']:
+            for comp in ('translation', 'rotation', 'scaling'):
+                ts_list = bone[comp]['timestamps']
+                kf_list = bone[comp]['keyframes']
+                if idx < len(ts_list) and target < len(ts_list):
+                    ts_list[idx] = list(ts_list[target])
+                    kf_list[idx] = list(kf_list[target])
+
+        a = sks1['anims'][idx]
+        new_raw = bytearray(a['raw'])
+        struct.pack_into('<I', new_raw, SKS1_FLAGS_OFFSET, flags | SKS1_EMBEDDED_FLAG)
+        sks1['anims'][idx] = dict(a)
+        sks1['anims'][idx]['raw'] = bytes(new_raw)
+        resolved.append((idx, a['animID'], a['subID'], target,
+                          sks1['anims'][target]['animID'] if target is not None else None))
+
+    if resolved:
+        print("  [alias-resolve] copied real track data into %d alias entries so they no longer "
+              "need external .anim resolution:" % len(resolved))
+        for idx, animid, subid, target, target_animid in resolved:
+            print("    - index %d (animID=%d subID=%d) <- real data from index %d (animID=%d)"
+                  % (idx, animid, subid, target, target_animid))
+    if unresolved:
+        print("  [alias-resolve] %d alias entries could not be resolved (their chain doesn't "
+              "lead to any entry with real embedded data -- likely still needs its own .anim "
+              "baked in, or baking the animation it ultimately points to will fix this too): %s"
+              % (len(unresolved), unresolved))
+
+
 def merge_skel_anim(skel_path, out_path, anim_paths, force_all_embedded=False):
     skel_chunks = ms.load(skel_path)
     skb1_payload = skel_chunks['SKB1']
@@ -207,8 +293,6 @@ def merge_skel_anim(skel_path, out_path, anim_paths, force_all_embedded=False):
 
     overrides = {}          # anim_index -> afsb bytes
     embedded_animid_subid = set()
-
-    SKS1_ALIAS_FLAG = 0x40  # M2Sequence.flags: this record is an alias of another (no own track data)
 
     for anim_path in anim_paths:
         anim_id, sub_id, afsb = load_anim_afsb(anim_path)
@@ -264,10 +348,23 @@ def merge_skel_anim(skel_path, out_path, anim_paths, force_all_embedded=False):
 
     if force_all_embedded:
         forced = 0
+        skipped_aliases = 0
         for idx, a in enumerate(sks1['anims']):
             raw = a['raw']
             flags = struct.unpack_from('<I', raw, SKS1_FLAGS_OFFSET)[0]
             if flags & SKS1_EMBEDDED_FLAG:
+                continue
+            if flags & SKS1_ALIAS_FLAG:
+                # Genuine alias (flags & 0x40): has no track data of its own by
+                # design -- its bone-track slots hold placeholder/sentinel
+                # values (e.g. timestamp 0xFFFFFFFF), not real keyframes.
+                # Forcing 0x20 here tells the client this record has real
+                # embedded data, so it plays the sentinel placeholder directly
+                # instead of following aliasNext to the real animation --
+                # confirmed cause of animations running far longer than they
+                # should (the sentinel timestamp is effectively "almost never
+                # ends"). Leave these exactly as they were.
+                skipped_aliases += 1
                 continue
             new_raw = bytearray(raw)
             struct.pack_into('<I', new_raw, SKS1_FLAGS_OFFSET, flags | SKS1_EMBEDDED_FLAG)
@@ -282,6 +379,11 @@ def merge_skel_anim(skel_path, out_path, anim_paths, force_all_embedded=False):
                   "embedded data nor a valid alias chain to one that does will make the client "
                   "think it has data when it doesn't, which can look wrong or worse than leaving "
                   "it flagged external." % forced)
+        if skipped_aliases:
+            print("  [force-embedded] left %d genuine alias entries (flags & 0x40) untouched -- "
+                  "they have no track data of their own by design and forcing the embedded flag "
+                  "on them causes the client to play placeholder/sentinel data instead of "
+                  "following the alias chain." % skipped_aliases)
 
     merged_skb1 = build_skb1_for_write(raw_skb1, skb1_payload, overrides)
 
@@ -300,6 +402,8 @@ def merge_skel_anim(skel_path, out_path, anim_paths, force_all_embedded=False):
     if bad:
         print("  [warn] %d sub-blocks could not be resolved (see above) -- "
               "output written anyway but review those bones/animations." % bad)
+
+    resolve_sequence_aliases(sks1, merged_skb1)
 
     out_chunks = [ms.make_chunk('SKL1', skel_chunks['SKL1'])]
     out_chunks.append(ms.make_chunk('SKS1', ms.write_sks1(sks1)))
